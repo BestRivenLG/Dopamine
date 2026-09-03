@@ -7,6 +7,12 @@
 #choma:
 #	$(MAKE) -C ChOma TARGET=ios DISABLE_SIGNING=1 DYLIB_LDFLAGS="-install_name @loader_path/libchoma.dylib" $@
 
+LOCAL_THEOS := $(abspath ../.deps/theos)
+ifneq ($(wildcard $(LOCAL_THEOS)/makefiles/common.mk),)
+export THEOS ?= $(LOCAL_THEOS)
+endif
+TAR_TOOL ?= $(shell command -v gtar 2>/dev/null || echo ./tar)
+
 all: basebin.tar
 
 subprojects: ChOma XPF MachOMerger opainject libjailbreak systemhook forkfix launchdhook hookd boomerang jbctl idownloadd watchdoghook rootlesshooks dopamine
@@ -29,7 +35,7 @@ MachOMerger: .build .include
 	@cp MachOMerger/MachOMerger .build
 
 opainject: .build .include
-	$(MAKE) -C opainject FINALPACKAGE=1
+	$(MAKE) -C opainject FINALPACKAGE=1 TARGET=iphone:clang:26.5:14.0
 	@ldid -Cadhoc -s opainject/.theos/obj/opainject
 	@cp opainject/.theos/obj/opainject .build
 
@@ -95,7 +101,7 @@ ifneq (,$(wildcard $(shell xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc
 endif
 
 basebin.tc: subprojects
-	trustcache create .build/basebin.tc .build
+	./trustcache create .build/basebin.tc .build
 	cp .build/basebin.tc basebin.tc
 
 # dyldhook dylibs do not need to be added to the basebin trustcache
@@ -105,7 +111,7 @@ dyldhook: basebin.tc
 
 basebin.tar: basebin.tc dyldhook
 	@find ./.build -name ".DS_Store" -delete
-	@DYLD_FALLBACK_LIBRARY_PATH="." ./tar --transform "s/^.build/basebin/" -cvf "basebin.tar" ".build" --owner=0 --group=0
+	@DYLD_FALLBACK_LIBRARY_PATH="." $(TAR_TOOL) --transform "s/^.build/basebin/" -cvf "basebin.tar" ".build" --owner=0 --group=0
 
 clean:
 	@$(MAKE) -C ChOma $@

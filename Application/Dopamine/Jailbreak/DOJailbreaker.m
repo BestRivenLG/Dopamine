@@ -44,6 +44,19 @@ Boolean _CFPreferencesSynchronizeWithContainer(CFStringRef applicationID, CFStri
 CFArrayRef _CFPreferencesCopyKeyListWithContainer(CFStringRef applicationID, CFStringRef userName, CFStringRef hostName, CFStringRef containerPath);
 CFDictionaryRef _CFPreferencesCopyMultipleWithContainer(CFArrayRef keysToFetch, CFStringRef applicationID, CFStringRef userName, CFStringRef hostName, CFStringRef containerPath);
 
+static NSString *DOCanonicalPath(NSString *path)
+{
+    return [[path stringByResolvingSymlinksInPath] stringByStandardizingPath];
+}
+
+static BOOL DOPathIsInsideDirectory(NSString *path, NSString *directory)
+{
+    NSString *canonicalPath = DOCanonicalPath(path);
+    NSString *canonicalDirectory = DOCanonicalPath(directory);
+    return [canonicalPath isEqualToString:canonicalDirectory] ||
+        [canonicalPath hasPrefix:[canonicalDirectory stringByAppendingString:@"/"]];
+}
+
 //char *_dirhelper(int a, char *dst, size_t size);
 
 NSString *const JBErrorDomain = @"JBErrorDomain";
@@ -494,7 +507,17 @@ void *boomerang_server(struct boomerang_info *info)
                 NSDictionary *infoDictionary = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
                 NSString *appId = infoDictionary[@"CFBundleIdentifier"];
                 if (appId) {
-                    [userInstalledAppIds addObject:appId];
+                    // A container may remain after an app has been uninstalled.
+                    // Only report a duplicate while LaunchServices still considers
+                    // the user app installed and points to this exact container.
+                    LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:appId];
+                    BOOL isMatchingInstalledApp = appProxy.installed &&
+                        appProxy.bundleURL.path != nil &&
+                        [[NSFileManager defaultManager] fileExistsAtPath:appProxy.bundleURL.path] &&
+                        [DOCanonicalPath(appProxy.bundleURL.path) isEqualToString:DOCanonicalPath(appPath)];
+                    if (isMatchingInstalledApp) {
+                        [userInstalledAppIds addObject:appId];
+                    }
                 }
             }
         }
@@ -518,8 +541,10 @@ void *boomerang_server(struct boomerang_info *info)
     for (NSString *dopamineAppId in dopamineInstalledAppIds) {
         LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:dopamineAppId];
         if (appProxy.installed) {
-            NSString *appProxyPath = [[appProxy.bundleURL.path stringByResolvingSymlinksInPath] stringByStandardizingPath];
-            if (![appProxyPath hasPrefix:dopamineAppsPath]) {
+            // Ignore stale LaunchServices records whose bundle no longer exists.
+            if (appProxy.bundleURL.path &&
+                [[NSFileManager defaultManager] fileExistsAtPath:appProxy.bundleURL.path] &&
+                !DOPathIsInsideDirectory(appProxy.bundleURL.path, dopamineAppsPath)) {
                 return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedDuplicateApps userInfo:@{ NSLocalizedDescriptionKey : [NSString stringWithFormat:DOLocalizedString(@"Duplicate_Apps_Error_Icon_Cache"), dopamineAppId, dopamineAppsPath, appProxy.bundleURL.path]}];
             }
         }

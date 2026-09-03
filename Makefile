@@ -1,6 +1,9 @@
 export NIGHTLY ?= 0
 
 export BUILD_STANDALONE ?= 0
+ifeq ($(strip $(BUILD_STANDALONE)),)
+export BUILD_STANDALONE := 0
+endif
 
 ifeq ($(NIGHTLY), 1)
 export COMMIT_HASH = $(shell git rev-parse HEAD)
