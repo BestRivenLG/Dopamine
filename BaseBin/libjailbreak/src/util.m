@@ -5,30 +5,27 @@
 
 bool is_dopamine_app(const char *pathC)
 {
-	if (!jbinfo(appIdentifier)) return false;
-
-	// Make sure the prefix is sane
-	const char wantedPrefixC[] = "/private/var/containers/Bundle/Application/";
-	if (strncmp(pathC, wantedPrefixC, (sizeof(wantedPrefixC) - 1)) != 0) return false;
-
-	// Make sure there are no path traversals
+	if (!pathC || !jbinfo(appIdentifier)) return false;
 	if (strstr(pathC, "/../")) return false;
 
-	// Stricly enforce the number of slashes (8)
-	// /private/var/containers/Bundle/Application/*/*.app/*
-	// ^       ^   ^          ^      ^           ^ ^     ^
-	uint64_t slashNum = 0;
-	uint64_t idx = 0;
-	while (pathC[idx] != 0) {
-		if (pathC[idx++] == '/') {
-			slashNum++;
-		}
+	const char *prefixPrivate = "/private/var/containers/Bundle/Application/";
+	const char *prefixVar = "/var/containers/Bundle/Application/";
+	if (strncmp(pathC, prefixPrivate, strlen(prefixPrivate)) != 0 &&
+		strncmp(pathC, prefixVar, strlen(prefixVar)) != 0) {
+		return false;
 	}
-	if (slashNum != 8) return false;
 
 	@autoreleasepool {
 		NSString *path = [NSString stringWithUTF8String:pathC];
-		NSString *infoPlistPath = [[path stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"Info.plist"];
+		NSString *appPath = path;
+		while (appPath.length && ![appPath.pathExtension isEqualToString:@"app"]) {
+			NSString *parent = [appPath stringByDeletingLastPathComponent];
+			if ([parent isEqualToString:appPath] || parent.length == 0) return false;
+			appPath = parent;
+		}
+		if (![appPath.pathExtension isEqualToString:@"app"]) return false;
+
+		NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
 		if (![[NSFileManager defaultManager] fileExistsAtPath:infoPlistPath]) return false;
 
 		NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];

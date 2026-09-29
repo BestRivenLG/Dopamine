@@ -824,6 +824,7 @@ int cmd_wait_for_exit(pid_t pid)
 	int status = 0;
 	do {
 		if (waitpid(pid, &status, 0) == -1) {
+			if (errno == EINTR) continue;
 			return -1;
 		}
 	} while (!WIFEXITED(status) && !WIFSIGNALED(status));

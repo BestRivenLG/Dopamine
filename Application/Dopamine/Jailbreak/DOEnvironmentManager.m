@@ -13,6 +13,9 @@
 #import <sys/utsname.h>
 #import <sys/stat.h>
 #import <unistd.h>
+#import <errno.h>
+#import <string.h>
+#import <sys/wait.h>
 #import <mach-o/dyld.h>
 #import <libgrabkernel2/libgrabkernel2.h>
 #import <libjailbreak/info.h>
@@ -284,6 +287,19 @@ extern char **environ;
             _jailbrokenVersion = [NSString stringWithUTF8String:jbVersionC];
             free(jbVersionC);
         }
+        // Dopamine domain requires is_dopamine_app (custom bundle id / /var vs /private/var).
+        // Systemwide get_jbroot still works if launchdhook is alive.
+        if (!_isJailbroken) {
+            const char *root = jbclient_get_jbroot();
+            if (root && root[0]) {
+                _isJailbroken = YES;
+                NSString *versionPath = [[NSString stringWithUTF8String:root] stringByAppendingPathComponent:@"basebin/.version"];
+                NSString *ver = [NSString stringWithContentsOfFile:versionPath encoding:NSUTF8StringEncoding error:nil];
+                if (ver.length) _jailbrokenVersion = ver;
+            }
+            NSLog(@"isJailbroken fallback jbroot=%s -> %d version=%@", root ?: "(null)", _isJailbroken, _jailbrokenVersion);
+        }
+        NSLog(@"isJailbroken=%d version=%@", _isJailbroken, _jailbrokenVersion);
     });
 }
 
@@ -296,7 +312,7 @@ extern char **environ;
 - (void)setJailbroken:(BOOL)jailbroken withVersion:(NSString *)version
 {
     _isJailbroken = jailbroken;
-    if (_isJailbroken) _jailbrokenVersion = version;
+    _jailbrokenVersion = _isJailbroken ? version : nil;
 }
 
 - (BOOL)isJailbrokenWithOtherJailbreak
@@ -396,6 +412,8 @@ extern char **environ;
     if (!needsLegacySolution) {
         pipe(waitPipe);
         posix_spawn_file_actions_adddup2(&act, waitPipe[0], 3);
+        posix_spawn_file_actions_addclose(&act, waitPipe[0]);
+        posix_spawn_file_actions_addclose(&act, waitPipe[1]);
     }
     else {
         posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED);
@@ -403,10 +421,26 @@ extern char **environ;
 
     __block int pid = 0;
     __block int r = -1;
+    __block int spawnErrno = 0;
+
+    [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"spawnJbctl: path=%s exists=%d args=%@", argBuf[0], access(argBuf[0], X_OK) == 0, args] debug:YES];
 
     [self runAsRoot:^{
         [self runUnsandboxed:^{
+            // After fakelib is mounted, Dopamine sets DYLD_INSERT_LIBRARIES=systemhook.
+            // jbctl must not inherit that: systemhook SIGSEGVs in jbctl (wait status 11)
+            // and userspace reboot never runs. fakelib/protection jbctl works because
+            // those spawn before the env var is set.
+            char *insertCopy = NULL;
+            const char *insert = getenv("DYLD_INSERT_LIBRARIES");
+            if (insert) insertCopy = strdup(insert);
+            unsetenv("DYLD_INSERT_LIBRARIES");
             r = posix_spawn(&pid, argBuf[0], &act, &attr, (char *const *)argBuf, (char *const *)environ);
+            spawnErrno = errno;
+            if (insertCopy) {
+                setenv("DYLD_INSERT_LIBRARIES", insertCopy, 1);
+                free(insertCopy);
+            }
             if (needsLegacySolution) {
                 // Legacy solution is a gamble, which is why it was removed and superseeded by --waitfor
                 // But if jailbroken with <3.0.5, jbctl doesn't support --waitfor yet
@@ -423,18 +457,46 @@ extern char **environ;
     }
     free(argBuf);
 
+    [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"spawnJbctl: posix_spawn r=%d errno=%d (%s) pid=%d", r, spawnErrno, strerror(spawnErrno), pid] debug:YES];
+
     if (!needsLegacySolution) {
         if (r == 0) {
-            // We left the root/unsandbox block, now resume jbctl by writing to pipe
-            char w = 'w';
-            write(waitPipe[1], &w, sizeof(w));
+            // jbctl reads sizeof(int) from fd 3 before running the command.
+            int resume = 'w';
+            write(waitPipe[1], &resume, sizeof(resume));
         }
 
         close(waitPipe[0]);
         close(waitPipe[1]);
     }
 
-    return cmd_wait_for_exit(pid);
+    if (r != 0 || pid <= 0) {
+        [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"spawnJbctl failed: r=%d errno=%d (%s) pid=%d args=%@", r, spawnErrno, strerror(spawnErrno), pid, args] debug:YES];
+        return r != 0 ? r : -1;
+    }
+
+    int status = 0;
+    int waitResult = 0;
+    do {
+        waitResult = waitpid(pid, &status, 0);
+        if (waitResult == -1 && errno == EINTR) continue;
+        if (waitResult == -1) break;
+    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+    if (waitResult == -1) {
+        [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"spawnJbctl waitpid failed: errno=%d (%s) pid=%d args=%@", errno, strerror(errno), pid, args] debug:YES];
+        return -1;
+    }
+    if (WIFSIGNALED(status)) {
+        [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"spawnJbctl: killed by signal %d args=%@", WTERMSIG(status), args] debug:YES];
+        return status;
+    }
+    if (WIFEXITED(status)) {
+        int exitCode = WEXITSTATUS(status);
+        [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"spawnJbctl: exited %d args=%@", exitCode, args] debug:YES];
+        return exitCode;
+    }
+    [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"spawnJbctl: unexpected status=%d args=%@", status, args] debug:YES];
+    return status;
 }
 
 - (int)runTrollStoreAction:(NSString *)action
@@ -452,9 +514,28 @@ extern char **environ;
     [self spawnJbctlAsRootWithArgs:@[@"respring"]];
 }
 
-- (void)rebootUserspace
+- (int)rebootUserspace
 {
-    [self spawnJbctlAsRootWithArgs:@[@"reboot_userspace"]];
+    // Must go through jbctl: it has com.apple.private.xpc.launchd.userspace-reboot.
+    // Calling reboot3 from the Dopamine app skips that entitlement and leaves a
+    // half-initialized userspace (Settings crashes, Xcode cannot deploy).
+    uint32_t csflags = 0;
+    csops(getpid(), CS_OPS_STATUS, &csflags, sizeof(csflags));
+    [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"rebootUserspace: uid=%d euid=%d jailbroken=%d csflags=0x%x debugger=%d", getuid(), geteuid(), [self isJailbroken], csflags, !!(csflags & CS_DEBUGGED)] debug:YES];
+    int r = [self spawnJbctlAsRootWithArgs:@[@"reboot_userspace"]];
+    [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"rebootUserspace: jbctl returned %d", r] debug:YES];
+    if (r == 0) {
+        // reboot3 returning 0 means launchd accepted the request. The calling
+        // process is supposed to sit still until userspace teardown kills it.
+        // Treating 0 as failure and restoring the UI races the reboot.
+        [[DOUIManager sharedInstance] sendLog:@"rebootUserspace: reboot3 accepted, waiting for teardown" debug:YES];
+        for (int i = 0; i < 30; i++) {
+            sleep(1);
+        }
+        [[DOUIManager sharedInstance] sendLog:@"rebootUserspace: still alive after 30s, reboot did not happen" debug:YES];
+        return -2;
+    }
+    return r;
 }
 
 - (void)rebuildIconCache

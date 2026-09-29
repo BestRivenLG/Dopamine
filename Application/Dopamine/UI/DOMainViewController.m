@@ -101,6 +101,21 @@
                 [[DOEnvironmentManager sharedManager] rebootUserspace];
             }];
         }],
+        [UIAction actionWithTitle:@"越狱日志" image:[UIImage systemImageNamed:@"doc.text" withConfiguration:[DOGlobalAppearance smallIconImageConfiguration]] identifier:@"jb-log" handler:^(__kindof UIAction * _Nonnull action) {
+            NSString *log = [[DOUIManager sharedInstance] lastJailbreakLog];
+            if (log.length == 0) {
+                NSString *path = [[DOUIManager sharedInstance] jailbreakLogPath] ?: @"Documents/jailbreak.log";
+                NSError *readError = nil;
+                [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&readError];
+                NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+                NSString *message = [NSString stringWithFormat:@"未找到可读取的日志。\n当前路径：%@\n文件大小：%@\n读取错误：%@\n独立日志：/var/mobile/dopamine-launchd.log", path, attributes[NSFileSize] ?: @"文件不存在", readError.localizedDescription ?: @"无"];
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"越狱日志" message:message preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [self presentViewController:alert animated:YES completion:nil];
+                return;
+            }
+            [self.navigationController pushViewController:[[DOLogCrashViewController alloc] initWithTitle:@"越狱日志" body:log] animated:YES];
+        }],
         [UIAction actionWithTitle:DOLocalizedString(@"Menu_Credits_Title") image:[UIImage systemImageNamed:@"info.circle" withConfiguration:[DOGlobalAppearance smallIconImageConfiguration]] identifier:@"credits" handler:^(__kindof UIAction * _Nonnull action) {
             [self.navigationController pushViewController:[[DOCreditsViewController alloc] init] animated:YES];
         }]
@@ -269,7 +284,28 @@
                 // No errors
                 [[DOUIManager sharedInstance] completeJailbreak];
                 [self fadeToBlack: ^{
-                    [jailbreaker finalize];
+                    // waitpid on the main thread is interrupted by UIKit (EINTR)
+                    // and then looks like a reboot failure while the spinner keeps running.
+                    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                        int rebootResult = [jailbreaker finalize];
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"Userspace reboot returned %d; restoring UI", rebootResult] debug:YES];
+                            [[DOUIManager sharedInstance] failLastLog];
+                            UIView *mainView = self.parentViewController.view ?: self.view;
+                            self.hideStatusBar = NO;
+                            [UIView animateWithDuration:0.3 animations:^{
+                                mainView.alpha = 1.0;
+                                mainView.transform = CGAffineTransformIdentity;
+                            }];
+                            NSString *message = [NSString stringWithFormat:@"用户空间重启失败 (jbctl=%d)。成功时应黑屏后回到桌面。请确认 Xcode 已 Stop，从主屏幕打开再越狱；若仍失败，长按电源+音量关机重启。", rebootResult];
+                            UIAlertController *alertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Log_Error") message:message preferredStyle:UIAlertControllerStyleAlert];
+                            UIAlertAction *rebootAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Reboot") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                                [[DOEnvironmentManager sharedManager] reboot];
+                            }];
+                            [alertController addAction:rebootAction];
+                            [self presentViewController:alertController animated:YES completion:nil];
+                        });
+                    });
                 }];
             }
         });
@@ -358,7 +394,7 @@
     if (didFade)
         return;
     didFade = true;
-    UIView *mainView = self.parentViewController.view;
+    UIView *mainView = self.parentViewController.view ?: self.view;
     float deviceCornerRadius = [[[UIScreen mainScreen] valueForKey:@"_displayCornerRadius"] floatValue];
 
     mainView.layer.cornerRadius = deviceCornerRadius;

@@ -1,58 +1,129 @@
 #!/usr/bin/env python3
 import os
-import re
 import struct
-import subprocess
 import sys
-import tempfile
 import uuid
+import hashlib
+
+FAT_MAGIC = 0xCAFEBABE
+FAT_CIGAM = 0xBEBAFECA
+MH_MAGIC = 0xFEEDFACE
+MH_CIGAM = 0xCEFAEDFE
+MH_MAGIC_64 = 0xFEEDFACF
+MH_CIGAM_64 = 0xCFFAEDFE
+LC_CODE_SIGNATURE = 0x1D
+CSMAGIC_EMBEDDED_SIGNATURE = 0xFADE0CC0
+CSMAGIC_CODEDIRECTORY = 0xFADE0C02
+CS_HASHTYPE_SHA1 = 1
+CS_HASHTYPE_SHA256 = 2
+CS_CDHASH_LEN = 20
 
 
-CDHASH_RE = re.compile(r"^CDHash=([0-9a-fA-F]{40})$", re.MULTILINE)
+def u32(data, off, endian):
+    return struct.unpack_from(endian + "I", data, off)[0]
 
 
-def run(command):
-    return subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-
-
-def archs_for(path):
-    result = run(["xcrun", "lipo", "-archs", path])
-    if result.returncode != 0:
+def macho_slices(data):
+    if len(data) < 8:
         return []
-    return result.stdout.split()
+    magic = struct.unpack_from(">I", data, 0)[0]
+    if magic in (FAT_MAGIC, FAT_CIGAM):
+        endian = ">" if magic == FAT_MAGIC else "<"
+        nfat = struct.unpack_from(endian + "I", data, 4)[0]
+        slices = []
+        for i in range(nfat):
+            off = 8 + i * 20
+            if off + 20 > len(data):
+                break
+            slice_off = struct.unpack_from(endian + "I", data, off + 8)[0]
+            slice_size = struct.unpack_from(endian + "I", data, off + 12)[0]
+            if slice_off + slice_size <= len(data):
+                slices.append(data[slice_off:slice_off + slice_size])
+        return slices
+    if magic in (MH_MAGIC, MH_CIGAM, MH_MAGIC_64, MH_CIGAM_64):
+        return [data]
+    return []
 
 
-def cdhash_for(path):
-    result = run(["codesign", "-d", "-vvvv", path])
-    match = CDHASH_RE.search(result.stdout)
-    if not match:
+def code_signature_blob(macho):
+    if len(macho) < 32:
         return None
-    return bytes.fromhex(match.group(1))
+    magic = struct.unpack_from(">I", macho, 0)[0]
+    if magic not in (MH_MAGIC, MH_CIGAM, MH_MAGIC_64, MH_CIGAM_64):
+        return None
+    endian = ">" if magic in (MH_MAGIC, MH_MAGIC_64) else "<"
+    is_64 = magic in (MH_MAGIC_64, MH_CIGAM_64)
+    ncmds = u32(macho, 16, endian)
+    cmd_off = 32 if is_64 else 28
+    for _ in range(ncmds):
+        if cmd_off + 8 > len(macho):
+            return None
+        cmd = u32(macho, cmd_off, endian)
+        cmdsize = u32(macho, cmd_off + 4, endian)
+        if cmdsize < 8:
+            return None
+        if cmd == LC_CODE_SIGNATURE:
+            if cmd_off + 16 > len(macho):
+                return None
+            dataoff = u32(macho, cmd_off + 8, endian)
+            datasize = u32(macho, cmd_off + 12, endian)
+            if dataoff + datasize > len(macho):
+                return None
+            return macho[dataoff:dataoff + datasize]
+        cmd_off += cmdsize
+    return None
 
 
-def cdhashes_for(path):
-    archs = archs_for(path)
-    if not archs:
-        return []
-    if len(archs) == 1:
-        cdhash = cdhash_for(path)
-        return [cdhash] if cdhash else []
-
+def cdhashes_from_superblob(blob):
     hashes = []
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for arch in archs:
-            thin_path = os.path.join(tmpdir, arch)
-            result = run(["xcrun", "lipo", path, "-thin", arch, "-output", thin_path])
-            if result.returncode != 0:
-                continue
-            cdhash = cdhash_for(thin_path)
-            if cdhash:
-                hashes.append(cdhash)
+    if not blob or len(blob) < 12:
+        return hashes
+    magic = struct.unpack_from(">I", blob, 0)[0]
+    if magic != CSMAGIC_EMBEDDED_SIGNATURE:
+        return hashes
+    length = struct.unpack_from(">I", blob, 4)[0]
+    count = struct.unpack_from(">I", blob, 8)[0]
+    if length > len(blob):
+        length = len(blob)
+    for i in range(count):
+        idx_off = 12 + i * 8
+        if idx_off + 8 > length:
+            break
+        blob_off = struct.unpack_from(">I", blob, idx_off + 4)[0]
+        if blob_off + 8 > length:
+            continue
+        blob_magic = struct.unpack_from(">I", blob, blob_off)[0]
+        blob_len = struct.unpack_from(">I", blob, blob_off + 4)[0]
+        if blob_magic != CSMAGIC_CODEDIRECTORY or blob_len < 44:
+            continue
+        if blob_off + blob_len > length:
+            continue
+        cd = blob[blob_off:blob_off + blob_len]
+        hash_type = cd[37]
+        if hash_type == CS_HASHTYPE_SHA1:
+            digest = hashlib.sha1(cd).digest()
+        elif hash_type == CS_HASHTYPE_SHA256:
+            digest = hashlib.sha256(cd).digest()
+        else:
+            continue
+        hashes.append((digest[:CS_CDHASH_LEN], hash_type))
     return hashes
 
 
-def collect_cdhashes(directory):
-    hashes = set()
+def cdhashes_for(path):
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return []
+    hashes = []
+    for slice_data in macho_slices(data):
+        hashes.extend(cdhashes_from_superblob(code_signature_blob(slice_data)))
+    return hashes
+
+
+def collect_entries(directory):
+    entries = {}
     for root, dirs, files in os.walk(directory):
         dirs[:] = [name for name in dirs if name != ".DS_Store"]
         for name in files:
@@ -61,22 +132,24 @@ def collect_cdhashes(directory):
             path = os.path.join(root, name)
             if not os.path.isfile(path):
                 continue
-            for cdhash in cdhashes_for(path):
-                print(f"Collecting cdhash of {path}")
-                hashes.add(cdhash)
-    return sorted(hashes)
+            for cdhash, hash_type in cdhashes_for(path):
+                print(f"Collecting cdhash of {path} type={hash_type}")
+                entries[cdhash] = hash_type
+    return sorted(entries.items(), key=lambda item: item[0])
 
 
 def create(output_path, directory):
-    hashes = collect_cdhashes(directory)
+    entries = collect_entries(directory)
     with open(output_path, "wb") as output:
         output.write(struct.pack("<I", 1))
         output.write(uuid.uuid4().bytes)
-        output.write(struct.pack("<I", len(hashes)))
-        for cdhash in hashes:
+        output.write(struct.pack("<I", len(entries)))
+        for cdhash, hash_type in entries:
             output.write(cdhash)
-            output.write(bytes([2, 0]))
-    print(f"Created {output_path} with {len(hashes)} cdhashes")
+            output.write(bytes([hash_type, 0]))
+    print(f"Created {output_path} with {len(entries)} cdhashes")
+    if len(entries) == 0:
+        print("warning: trustcache is empty; codesign blobs were not parsed", file=sys.stderr)
 
 
 def main():

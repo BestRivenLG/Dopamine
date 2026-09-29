@@ -3,6 +3,7 @@
 #include <bsm/audit.h>
 #include <libproc.h>
 #include <sys/proc_info.h>
+#include "../jb_log.h"
 extern int fileport_makefd (mach_port_t port);
 
 int systemwide_process_checkin(audit_token_t *processToken, char **rootPathOut, char **bootUUIDOut, char **sandboxExtensionsOut, bool *fullyDebuggedOut, bool *forceCSAdhocOut);
@@ -45,6 +46,10 @@ int jbserver_send_mach_reply(mach_msg_header_t *hdr, void *replyData)
 int jbserver_received_mach_message(audit_token_t *auditToken, struct jbserver_mach_msg *jbsMachMsg)
 {
 	int r = -1;
+	static unsigned checkinLogCount = 0;
+	bool logCheckin = jbsMachMsg->action == JBSERVER_MACH_CHECKIN && __sync_fetch_and_add(&checkinLogCount, 1) < 64;
+	pid_t clientPid = audit_token_to_pid(*auditToken);
+	if (logCheckin) jb_log("mach checkin begin pid=%d", clientPid);
 
 	// Anything implemented by the mach server is provided systemwide
 	// So we also need to honor the allowed handler of the systemwide domain
@@ -167,7 +172,11 @@ int jbserver_received_mach_message(audit_token_t *auditToken, struct jbserver_ma
 		r = 0;
 	}
 
-	jbserver_send_mach_reply(&jbsMachMsg->hdr, replyData);
+	int sendResult = jbserver_send_mach_reply(&jbsMachMsg->hdr, replyData);
+	if (logCheckin) {
+		int status = replyData ? ((struct jbserver_mach_msg_reply *)replyData)->status : -1;
+		jb_log("mach checkin end pid=%d status=%d send=%d", clientPid, status, sendResult);
+	}
 
 	if (replyData) free(replyData);
 

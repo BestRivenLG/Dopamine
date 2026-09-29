@@ -9,6 +9,7 @@
 #include <libjailbreak/kcall_arm64.h>
 #include <libjailbreak/stock_fixes.h>
 #include <unistd.h>
+#include "jb_log.h"
 
 int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *__restrict attr, mach_port_t portarray[], uint32_t count);
 
@@ -25,8 +26,10 @@ void boomerang_stashPrimitives()
 	mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &serverPort);
 	mach_port_insert_right(mach_task_self(), serverPort, serverPort, MACH_MSG_TYPE_MAKE_SEND);
 
-	// Small server provided to boomerang to obtain exploit primitives
-	dispatch_source_t serverSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_MACH_RECV, (uintptr_t)serverPort, 0, dispatch_get_main_queue());
+	// Do not use the main queue: userspace reboot posix_spawn can run on
+	// launchd's main thread, and waiting there for a main-queue source deadlocks.
+	dispatch_queue_t boomerangQueue = dispatch_queue_create("com.opa334.boomerang.stash", DISPATCH_QUEUE_SERIAL);
+	dispatch_source_t serverSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_MACH_RECV, (uintptr_t)serverPort, 0, boomerangQueue);
 	dispatch_source_set_event_handler(serverSource, ^{
 		xpc_object_t xdict = NULL;
 		if (!xpc_pipe_receive(serverPort, &xdict)) {
@@ -43,12 +46,20 @@ void boomerang_stashPrimitives()
 	posix_spawnattr_t attr = NULL;
 	posix_spawnattr_init(&attr);
 	posix_spawnattr_set_registered_ports_np(&attr, (mach_port_t[]){ MACH_PORT_NULL, MACH_PORT_NULL, serverPort }, 3);
-	int ret = posix_spawn(&boomerangPid, JBROOT_PATH("/basebin/boomerang"), NULL, &attr, NULL, NULL);
-	if (ret != 0) return;
+	const char *boomerangPath = JBROOT_PATH("/basebin/boomerang");
+	char *const boomerangArgv[] = { (char *)boomerangPath, NULL };
+	// launchd's environment injects launchdhook into children; boomerang must start clean.
+	int ret = posix_spawn(&boomerangPid, boomerangPath, NULL, &attr, boomerangArgv, NULL);
+	jb_log("boomerang posix_spawn path=%s ret=%d pid=%d", boomerangPath, ret, boomerangPid);
+	if (ret != 0) {
+		posix_spawnattr_destroy(&attr);
+		return;
+	}
 	posix_spawnattr_destroy(&attr);
 
 	// Wait for boomerang to retrieve the primitives from launchd (handled in server above)
-	dispatch_semaphore_wait(boomerangDone, DISPATCH_TIME_FOREVER);
+	long waitRc = dispatch_semaphore_wait(boomerangDone, DISPATCH_TIME_FOREVER);
+	jb_log("boomerang wait rc=%ld (0=ok)", waitRc);
 	dispatch_source_cancel(serverSource);
 	mach_port_deallocate(mach_task_self(), serverPort);
 
@@ -64,7 +75,10 @@ int boomerang_recoverPrimitives(bool firstRetrieval, bool shouldEndBoomerang)
 	// Use it to recover primitives, afterwards replace it with MACH_PORT_NULL to make launchd happy
 	mach_port_t *registeredPorts;
 	mach_msg_type_number_t registeredPortsCount = 0;
-	if (mach_ports_lookup(mach_task_self(), &registeredPorts, &registeredPortsCount) != 0 || registeredPortsCount < 3) return -1;
+	if (mach_ports_lookup(mach_task_self(), &registeredPorts, &registeredPortsCount) != 0 || registeredPortsCount < 3) {
+		jb_log("recover: ports lookup failed count=%u", registeredPortsCount);
+		return -1;
+	}
 	mach_port_t boomerangPort = registeredPorts[2];
 	if (boomerangPort == MACH_PORT_NULL) return -2;
 	jbclient_xpc_set_custom_port(boomerangPort);
@@ -84,7 +98,9 @@ int boomerang_recoverPrimitives(bool firstRetrieval, bool shouldEndBoomerang)
 	// Handing off full physrw from the app is really slow and causes watchdog timeouts
 	// But from launchd it's generally fine, no clue why
 	bool physrwPTE = firstRetrieval && !is_kcall_available();
-	jbclient_initialize_primitives_internal(physrwPTE);
+	int primitiveResult = jbclient_initialize_primitives_internal(physrwPTE);
+	jb_log("recover: initialize primitives result=%d physrwPTE=%d", primitiveResult, physrwPTE);
+	if (primitiveResult != 0) return -3;
 
 	if (shouldEndBoomerang) {
 		// Send done message to boomerang

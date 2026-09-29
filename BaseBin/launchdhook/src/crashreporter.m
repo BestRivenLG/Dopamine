@@ -3,7 +3,6 @@
 #include <mach-o/dyld.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
-#include <pthread/stack_np.h>
 #include <pthread/pthread.h>
 #include <mach/exception_types.h>
 #include <sys/utsname.h>
@@ -22,59 +21,12 @@ void abort_with_reason(uint32_t reason_namespace, uint64_t reason_code, const ch
 
 static NSUncaughtExceptionHandler* defaultNSExceptionHandler = NULL;
 
-#define	INSTACK(a)	((a) >= stackbot && (a) <= stacktop)
-#if defined(__x86_64__)
-#define	ISALIGNED(a)	((((uintptr_t)(a)) & 0xf) == 0)
-#elif defined(__i386__)
-#define	ISALIGNED(a)	((((uintptr_t)(a)) & 0xf) == 8)
-#elif defined(__arm__) || defined(__arm64__)
-#define	ISALIGNED(a)	((((uintptr_t)(a)) & 0x1) == 0)
-#endif
-
 #define EXC_MASK_CRASH_RELATED (EXC_MASK_BAD_ACCESS | \
 		EXC_MASK_BAD_INSTRUCTION |			  \
 		EXC_MASK_ARITHMETIC |				  \
 		EXC_MASK_EMULATION |				  \
 		EXC_MASK_SOFTWARE |					  \
 		EXC_MASK_BREAKPOINT)
-
-__attribute__((noinline))
-static void pthread_backtrace(pthread_t pthread, vm_address_t *buffer, unsigned max, unsigned *nb,
-		unsigned skip, void *startfp)
-{
-	void *frame, *next;
-	void *stacktop = pthread_get_stackaddr_np(pthread);
-	void *stackbot = stacktop - pthread_get_stacksize_np(pthread);
-
-	*nb = 0;
-
-	// Rely on the fact that our caller has an empty stackframe (no local vars)
-	// to determine the minimum size of a stackframe (frame ptr & return addr)
-	frame = startfp;
-	next = (void*)pthread_stack_frame_decode_np((uintptr_t)frame, NULL);
-
-	/* make sure return address is never out of bounds */
-	stacktop -= (next - frame);
-
-	if(!INSTACK(frame) || !ISALIGNED(frame))
-		return;
-	while (startfp || skip--) {
-		if (startfp && startfp < next) break;
-		if(!INSTACK(next) || !ISALIGNED(next) || next <= frame)
-			return;
-		frame = next;
-		next = (void*)pthread_stack_frame_decode_np((uintptr_t)frame, NULL);
-	}
-	while (max--) {
-		uintptr_t retaddr;
-		next = (void*)pthread_stack_frame_decode_np((uintptr_t)frame, &retaddr);
-		buffer[*nb] = retaddr;
-		(*nb)++;
-		if(!INSTACK(next) || !ISALIGNED(next) || next <= frame)
-			return;
-		frame = next;
-	}
-}
 
 static crash_reporter_state gCrashReporterState = kCrashReporterStateNotActive;
 mach_port_t gExceptionPort = MACH_PORT_NULL;
@@ -257,23 +209,21 @@ void crashreporter_dump_image_list(FILE *f)
 
 void crashreporter_catch_mach(exception_raise_request *request, exception_raise_reply *reply)
 {
-	pthread_t pthread = pthread_from_mach_thread_np(request->thread.name);
-
 	mach_msg_type_number_t threadStateCount = ARM_THREAD_STATE64_COUNT;
-	arm_thread_state64_t threadState;
+	arm_thread_state64_t threadState = { 0 };
 	thread_get_state(request->thread.name, ARM_THREAD_STATE64, (thread_state_t)&threadState, &threadStateCount);
 
-	arm_exception_state64_t exceptionState;
+	arm_exception_state64_t exceptionState = { 0 };
 	mach_msg_type_number_t exceptionStateCount = ARM_EXCEPTION_STATE64_COUNT;
 	thread_get_state(request->thread.name, ARM_EXCEPTION_STATE64, (thread_state_t)&exceptionState, &exceptionStateCount);
 
 	reply->ndr = request->ndr;
 	reply->retcode = KERN_FAILURE;
 
-	vm_address_t *bt = malloc(100 * sizeof(vm_address_t));
-	memset(bt, 0, 100 * sizeof(vm_address_t));
-	unsigned c = 100;
-	pthread_backtrace(pthread, bt, c, &c, 0, (void *)__darwin_arm_thread_state64_get_fp(threadState));
+	// The faulting thread is suspended while handling its Mach exception.
+	// pthread_backtrace can wait on that thread forever, masking the fault with
+	// a watchdog panic. PC and LR below are enough to identify the crash site.
+	vm_address_t bt[] = { 0 };
 
 	char *name = NULL;
 	FILE *f = crashreporter_open_outfile("launchd", &name);
@@ -412,4 +362,3 @@ void crashreporter_start(void)
 		}
 	}
 }
-

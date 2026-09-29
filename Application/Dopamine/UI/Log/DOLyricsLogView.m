@@ -100,4 +100,19 @@
     [self.stackView.arrangedSubviews makeObjectsPerformSelector:@selector(setSuccess)];
 }
 
+- (void)didFail
+{
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self didFail];
+        });
+        return;
+    }
+
+    DOLyricsLogItemView *lastItemView = self.stackView.arrangedSubviews.lastObject;
+    if ([lastItemView respondsToSelector:@selector(setFailed)]) {
+        [lastItemView setFailed];
+    }
+}
+
 @end

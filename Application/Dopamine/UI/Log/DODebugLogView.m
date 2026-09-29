@@ -57,5 +57,10 @@
 
 }
 
+-(void)didFail
+{
+
+}
+
 
 @end

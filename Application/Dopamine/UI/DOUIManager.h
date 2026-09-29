@@ -17,6 +17,8 @@ NS_ASSUME_NONNULL_BEGIN
     DOPreferenceManager *_preferenceManager;
     NSDictionary *_fallbackLocalizations;
     NSLock *_logLock;
+    NSString *_documentsDirectory;
+    int _logFileFd;
 }
 
 @property (nonatomic, readonly) NSString *bootlogoPath;
@@ -29,7 +31,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)sendLog:(NSString*)log debug:(BOOL)debug update:(BOOL)update;
 - (void)sendLog:(NSString*)log debug:(BOOL)debug;
 - (void)completeJailbreak;
+- (void)failLastLog;
 - (void)startLogCapture;
+- (NSString *)jailbreakLogPath;
+- (NSString *)lastJailbreakLog;
 - (void)shareLogRecordFromView:(UIView *)sourceView;
 - (BOOL)isUpdateAvailable;
 - (BOOL)environmentUpdateAvailable;

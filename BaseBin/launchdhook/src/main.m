@@ -29,6 +29,7 @@
 #import "update.h"
 #import "jbserver/jbserver_local.h"
 #import "asl.h"
+#import "jb_log.h"
 
 bool gInEarlyBoot = true;
 
@@ -107,6 +108,7 @@ __attribute__((constructor)) static void initializer(void)
 	}
 
 	bool firstLoad = false;
+	jb_log("launchdhook init pid=%d insert=%s initialized=%s", getpid(), getenv("DYLD_INSERT_LIBRARIES") ?: "(null)", getenv("DOPAMINE_INITIALIZED") ?: "(null)");
 	if (getenv("DOPAMINE_INITIALIZED") != 0) {
 		// If Dopamine was initialized before, we assume we're coming from a userspace reboot
 
@@ -133,6 +135,7 @@ __attribute__((constructor)) static void initializer(void)
 	}
 
 	int err = boomerang_recoverPrimitives(firstLoad, true);
+	jb_log("recoverPrimitives firstLoad=%d err=%d", firstLoad, err);
 	if (err != 0) {
 		char msg[1000];
 		snprintf(msg, 1000, "Dopamine: Failed to recover primitives (error %d), cannot continue.", err);
@@ -192,4 +195,5 @@ __attribute__((constructor)) static void initializer(void)
 	// Set an identifier that uniquely identifies this userspace boot
 	// Part of rootless v2 spec
 	setenv("LAUNCHD_UUID", [NSUUID UUID].UUIDString.UTF8String, 1);
+	jb_log("launchdhook ready pid=%d", getpid());
 }

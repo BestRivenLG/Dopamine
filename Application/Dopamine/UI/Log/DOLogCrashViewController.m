@@ -15,6 +15,7 @@
 @interface DOLogCrashViewController ()
 
 @property (nonatomic, retain) NSString *title;
+@property (nonatomic, retain) NSString *body;
 
 @end
 
@@ -22,9 +23,15 @@
 
 - (id)initWithTitle:(NSString*)title
 {
+    return [self initWithTitle:title body:nil];
+}
+
+- (id)initWithTitle:(NSString*)title body:(NSString *)body
+{
     if (self = [super init])
     {
         self.title = title;
+        self.body = body;
     }
     return self;
 }
@@ -47,7 +54,12 @@
     
     __block DOActionMenuButton *shareButton;
     UIAction *shareAction = [UIAction actionWithTitle:DOLocalizedString(@"Button_Share") image:[UIImage systemImageNamed:@"square.and.arrow.up" withConfiguration:[DOGlobalAppearance smallIconImageConfiguration]] identifier:@"share" handler:^(__kindof UIAction * _Nonnull action) {
-        [[DOUIManager sharedInstance] shareLogRecordFromView:shareButton];
+        NSString *log = self->_logView.text;
+        if (!log.length) return;
+        UIActivityViewController *activityViewController = [[UIActivityViewController alloc] initWithActivityItems:@[log] applicationActivities:nil];
+        activityViewController.popoverPresentationController.sourceView = shareButton;
+        activityViewController.popoverPresentationController.sourceRect = shareButton.bounds;
+        [self presentViewController:activityViewController animated:YES completion:nil];
     }];
     shareButton = [DOActionMenuButton buttonWithAction:shareAction chevron:NO];
     
@@ -77,8 +89,12 @@
         [_logView.bottomAnchor constraintEqualToAnchor:shareButton.topAnchor constant:-10]
     ]];
 
-    NSArray *reverseLog = [[[DOUIManager sharedInstance] logRecord] reverseObjectEnumerator].allObjects;
-    _logView.text = [reverseLog componentsJoinedByString:@"\n"];
+    if (self.body.length) {
+        _logView.text = self.body;
+    } else {
+        NSArray *reverseLog = [[[DOUIManager sharedInstance] logRecord] reverseObjectEnumerator].allObjects;
+        _logView.text = [reverseLog componentsJoinedByString:@"\n"];
+    }
     _logView.editable = NO;
     _logView.font = [UIFont systemFontOfSize:14];
     _logView.textColor = [UIColor whiteColor];

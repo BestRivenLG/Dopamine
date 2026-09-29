@@ -263,22 +263,36 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     return nil;
 }
 
+- (void)logElevate:(NSString *)message
+{
+    // sendLog fsyncs the already-open log fd on this thread. printf via the stdout
+    // pipe can be lost if we hang/panic before the reader persists it.
+    [[DOUIManager sharedInstance] sendLog:message debug:YES];
+    printf("%s\n", message.UTF8String);
+    fflush(stdout);
+}
+
 - (NSError *)elevatePrivileges
 {
+    [self logElevate:[NSString stringWithFormat:@"elevate: begin uid=%d gid=%d", getuid(), getgid()]];
     uint64_t proc = proc_self();
+    [self logElevate:[NSString stringWithFormat:@"elevate: proc=%llx", proc]];
     uint64_t ucred = proc_ucred(proc);
+    [self logElevate:[NSString stringWithFormat:@"elevate: ucred=%llx", ucred]];
     
     // Get uid 0
     kwrite32(proc + koffsetof(proc, svuid), 0);
     kwrite32(ucred + koffsetof(ucred, svuid), 0);
     kwrite32(ucred + koffsetof(ucred, ruid), 0);
     kwrite32(ucred + koffsetof(ucred, uid), 0);
+    [self logElevate:[NSString stringWithFormat:@"elevate: wrote uid 0, getuid=%d", getuid()]];
     
     // Get gid 0
     kwrite32(proc + koffsetof(proc, svgid), 0);
     kwrite32(ucred + koffsetof(ucred, rgid), 0);
     kwrite32(ucred + koffsetof(ucred, svgid), 0);
     kwrite32(ucred + koffsetof(ucred, groups), 0);
+    [self logElevate:[NSString stringWithFormat:@"elevate: wrote gid 0, getgid=%d", getgid()]];
     
     // Add P_SUGID
     uint32_t flag = kread32(proc + koffsetof(proc, flag));
@@ -292,10 +306,16 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     
     // Unsandbox
     uint64_t label = kread_ptr(ucred + koffsetof(ucred, label));
+    [self logElevate:[NSString stringWithFormat:@"elevate: unsandbox label=%llx", label]];
     mac_label_set(label, 1, -1);
     NSError *error = nil;
     [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/var" error:&error];
     if (error) return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedUnsandbox userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"Failed to unsandbox, /var does not seem accessible (%s)", error.description.UTF8String]}];
+    [self logElevate:@"elevate: unsandbox ok"];
+    {
+        NSString *logPath = [[DOUIManager sharedInstance] jailbreakLogPath];
+        [logPath writeToFile:@"/var/mobile/dopamine-log-path" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
     setenv("HOME", "/var/root", true);
     setenv("CFFIXED_USER_HOME", "/var/root", true);
     setenv("TMPDIR", "/var/tmp", true);
@@ -322,10 +342,12 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     *pain = strdup("/var/tmp");*/
     
     // Get CS_PLATFORM_BINARY
+    [self logElevate:@"elevate: platformize"];
     proc_csflags_set(proc, CS_PLATFORM_BINARY);
     uint32_t csflags;
     csops(getpid(), CS_OPS_STATUS, &csflags, sizeof(csflags));
     if (!(csflags & CS_PLATFORM_BINARY)) return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedPlatformize userInfo:@{NSLocalizedDescriptionKey:@"Failed to get CS_PLATFORM_BINARY"}];
+    [self logElevate:[NSString stringWithFormat:@"elevate: done csflags=0x%x", csflags]];
     
     return nil;
 }
@@ -479,7 +501,7 @@ void *boomerang_server(struct boomerang_info *info)
 - (NSError *)ensureNoDuplicateApps
 {
     NSMutableSet *dopamineInstalledAppIds = [NSMutableSet new];
-    NSMutableSet *userInstalledAppIds = [NSMutableSet new];
+    NSMutableSet *duplicateUserApps = [NSMutableSet new];
     
     NSString *dopamineAppsPath = JBROOT_PATH(@"/Applications");
     NSString *userAppsPath = @"/var/containers/Bundle/Application";
@@ -498,56 +520,36 @@ void *boomerang_server(struct boomerang_info *info)
         }
     }
     
-    for (NSString *appUUID in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:userAppsPath error:nil]) {
-        NSString *UUIDPath = [userAppsPath stringByAppendingPathComponent:appUUID];
-        for (NSString *appCandidate in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:UUIDPath error:nil]) {
-            if ([appCandidate.pathExtension isEqualToString:@"app"]) {
-                NSString *appPath = [UUIDPath stringByAppendingPathComponent:appCandidate];
-                NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
-                NSDictionary *infoDictionary = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
-                NSString *appId = infoDictionary[@"CFBundleIdentifier"];
-                if (appId) {
-                    // A container may remain after an app has been uninstalled.
-                    // Only report a duplicate while LaunchServices still considers
-                    // the user app installed and points to this exact container.
-                    LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:appId];
-                    BOOL isMatchingInstalledApp = appProxy.installed &&
-                        appProxy.bundleURL.path != nil &&
-                        [[NSFileManager defaultManager] fileExistsAtPath:appProxy.bundleURL.path] &&
-                        [DOCanonicalPath(appProxy.bundleURL.path) isEqualToString:DOCanonicalPath(appPath)];
-                    if (isMatchingInstalledApp) {
-                        [userInstalledAppIds addObject:appId];
-                    }
-                }
-            }
+    for (NSString *dopamineAppId in dopamineInstalledAppIds) {
+        LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:dopamineAppId];
+        // Leftover containers after uninstall are ignored unless LaunchServices
+        // still considers this bundle id a live install outside /var/jb.
+        if (!appProxy.installed) continue;
+        
+        NSString *bundlePath = appProxy.bundleURL.path;
+        if (bundlePath.length == 0) continue;
+        if (![[NSFileManager defaultManager] fileExistsAtPath:bundlePath]) continue;
+        if (DOPathIsInsideDirectory(bundlePath, dopamineAppsPath)) continue;
+        
+        if (DOPathIsInsideDirectory(bundlePath, userAppsPath)) {
+            [duplicateUserApps addObject:dopamineAppId];
+            continue;
         }
+        
+        return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedDuplicateApps userInfo:@{ NSLocalizedDescriptionKey : [NSString stringWithFormat:DOLocalizedString(@"Duplicate_Apps_Error_Icon_Cache"), dopamineAppId, dopamineAppsPath, bundlePath]}];
     }
     
-    NSMutableSet *duplicateApps = dopamineInstalledAppIds.mutableCopy;
-    [duplicateApps intersectSet:userInstalledAppIds];
-    if (duplicateApps.count) {
+    if (duplicateUserApps.count) {
         NSMutableString *duplicateAppsString = [NSMutableString new];
         [duplicateAppsString appendString:@"["];
         BOOL isFirst = YES;
-        for (NSString *duplicateApp in duplicateApps) {
+        for (NSString *duplicateApp in duplicateUserApps) {
             if (isFirst) isFirst = NO;
             else [duplicateAppsString appendString:@", "];
             [duplicateAppsString appendString:duplicateApp];
         }
         [duplicateAppsString appendString:@"]"];
         return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedDuplicateApps userInfo:@{ NSLocalizedDescriptionKey : [NSString stringWithFormat:DOLocalizedString(@"Duplicate_Apps_Error_User_App"), duplicateAppsString, dopamineAppsPath]}];
-    }
-    
-    for (NSString *dopamineAppId in dopamineInstalledAppIds) {
-        LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:dopamineAppId];
-        if (appProxy.installed) {
-            // Ignore stale LaunchServices records whose bundle no longer exists.
-            if (appProxy.bundleURL.path &&
-                [[NSFileManager defaultManager] fileExistsAtPath:appProxy.bundleURL.path] &&
-                !DOPathIsInsideDirectory(appProxy.bundleURL.path, dopamineAppsPath)) {
-                return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedDuplicateApps userInfo:@{ NSLocalizedDescriptionKey : [NSString stringWithFormat:DOLocalizedString(@"Duplicate_Apps_Error_Icon_Cache"), dopamineAppId, dopamineAppsPath, appProxy.bundleURL.path]}];
-            }
-        }
     }
     
     return nil;
@@ -637,6 +639,7 @@ void *boomerang_server(struct boomerang_info *info)
     *errOut = [self elevatePrivileges];
 
     if (*errOut) return;
+    [self logElevate:[NSString stringWithFormat:@"Privileges elevated (uid=%d gid=%d)", getuid(), getgid()]];
     *errOut = [self showNonDefaultSystemApps];
     if (*errOut) {
         [self cleanUpPostExploitation];
@@ -649,12 +652,14 @@ void *boomerang_server(struct boomerang_info *info)
     }
 
     // Now that we are unsandboxed, populate the jailbreak root path
+    [self logElevate:@"elevate: ensureJailbreakRootExists"];
     *errOut = [[DOEnvironmentManager sharedManager] ensureJailbreakRootExists];
     if (*errOut) {
         [self cleanUpPostExploitation];
         return;
     }
     
+    [self logElevate:@"elevate: prepareBootstrap"];
     *errOut = [[DOEnvironmentManager sharedManager] prepareBootstrap];
     if (*errOut) return;
     setenv("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/var/jb/sbin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/usr/bin", 1);
@@ -692,9 +697,6 @@ void *boomerang_server(struct boomerang_info *info)
         return;
     }
     
-    // After the launchd hook is initialized, we need to make the app believe the device is jailbroken
-    [[DOEnvironmentManager sharedManager] setJailbroken:YES withVersion:[NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.version") encoding:NSUTF8StringEncoding error:nil]];
-    
     // Now that we can, protect important system files by bind mounting on top of them
     // This will be always be done during the userspace reboot
     // We also do it now though in case there is a failure between the now step and the userspace reboot
@@ -731,7 +733,10 @@ void *boomerang_server(struct boomerang_info *info)
         return;
     }
     *errOut = [self cleanUpPostExploitation];
-
+    if (*errOut) return;
+    
+    // Only mark the app as jailbroken after every step succeeded.
+    [[DOEnvironmentManager sharedManager] setJailbroken:YES withVersion:[NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.version") encoding:NSUTF8StringEncoding error:nil]];
 
     //printf("Starting launch daemons...\n");
     //exec_cmd_trusted(JBROOT_PATH("/usr/bin/uicache"), "-a", NULL);
@@ -743,10 +748,11 @@ void *boomerang_server(struct boomerang_info *info)
     printf("Done!\n");
 }
 
-- (void)finalize
+- (int)finalize
 {
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Rebooting Userspace") debug:NO];
-    [[DOEnvironmentManager sharedManager] rebootUserspace];
+    [[DOUIManager sharedInstance] sendLog:@"Jailbreak finished, rebooting userspace" debug:YES];
+    return [[DOEnvironmentManager sharedManager] rebootUserspace];
 }
 
 - (IOSurfaceRef)allocatePurpleGfxMemWithSize:(size_t)size

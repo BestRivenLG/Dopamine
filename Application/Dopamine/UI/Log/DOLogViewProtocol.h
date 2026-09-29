@@ -13,6 +13,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 -(void)showLog:(NSString *)log;
 -(void)didComplete;
+-(void)didFail;
 
 @optional
 - (void)updateLog:(NSString *)log;

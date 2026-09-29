@@ -11,6 +11,11 @@
 #import "DOTheme.h"
 #import "NSString+Version.h"
 #import <pthread.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <errno.h>
+#import <string.h>
+#import <sys/stat.h>
 
 @implementation DOUIManager
 
@@ -27,12 +32,105 @@
 - (id)init
 {
     if (self = [super init]){
-        _bootlogoPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/bootlogo.png"];
+        // elevatePrivileges later sets HOME=/var/root; pin Documents now.
+        // Prefer the container API so we don't depend on HOME at all.
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        _documentsDirectory = docs ?: [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+        _bootlogoPath = [_documentsDirectory stringByAppendingPathComponent:@"bootlogo.png"];
         _preferenceManager = [DOPreferenceManager sharedManager];
         _logRecord = [NSMutableArray new];
         _logLock = [NSLock new];
+        _logFileFd = -1;
     }
     return self;
+}
+
+- (NSString *)jailbreakLogPath
+{
+    return [_documentsDirectory stringByAppendingPathComponent:@"jailbreak.log"];
+}
+
+- (void)writeLogBytes:(const char *)bytes length:(size_t)len
+{
+    if (!bytes || len == 0) return;
+
+    if (_logFileFd >= 0) {
+        // fd was opened as mobile before elevatePrivileges; stays valid after uid 0 / HOME change.
+        write(_logFileFd, bytes, len);
+        fsync(_logFileFd);
+        return;
+    }
+
+    const char *path = self.jailbreakLogPath.fileSystemRepresentation;
+    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    if (fd < 0) return;
+    write(fd, bytes, len);
+    fsync(fd);
+    close(fd);
+}
+
+- (void)persistJailbreakLogLine:(NSString *)log
+{
+    if (log.length == 0) return;
+    NSString *line = [log hasSuffix:@"\n"] ? log : [log stringByAppendingString:@"\n"];
+    const char *bytes = line.UTF8String;
+    if (!bytes) return;
+    [self writeLogBytes:bytes length:strlen(bytes)];
+}
+
+- (NSString *)lastJailbreakLog
+{
+    NSString *primary = [NSString stringWithContentsOfFile:[self jailbreakLogPath] encoding:NSUTF8StringEncoding error:nil];
+
+    if (!primary.length) {
+        NSString *savedPath = [NSString stringWithContentsOfFile:@"/var/mobile/dopamine-log-path" encoding:NSUTF8StringEncoding error:nil];
+        savedPath = [savedPath stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([savedPath hasPrefix:@"/var/mobile/Containers/Data/Application/"] && [savedPath hasSuffix:@"/Documents/jailbreak.log"]) {
+            NSString *savedLog = [NSString stringWithContentsOfFile:savedPath encoding:NSUTF8StringEncoding error:nil];
+            if (savedLog.length) primary = [NSString stringWithFormat:@"[日志来源：%@]\n%@", savedPath, savedLog];
+        }
+    }
+
+    if (!primary.length) {
+        NSString *previousPath = [_documentsDirectory stringByAppendingPathComponent:@"jailbreak.previous.log"];
+        NSString *previousLog = [NSString stringWithContentsOfFile:previousPath encoding:NSUTF8StringEncoding error:nil];
+        if (previousLog.length) primary = [NSString stringWithFormat:@"[上一次越狱日志：%@]\n%@", previousPath, previousLog];
+    }
+
+    // Fallback if HOME drifted before we pinned Documents.
+    if (!primary.length) {
+        NSString *homePath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/jailbreak.log"];
+        if (![homePath isEqualToString:[self jailbreakLogPath]]) {
+            primary = [NSString stringWithContentsOfFile:homePath encoding:NSUTF8StringEncoding error:nil];
+        }
+    }
+
+    NSMutableString *combined = [NSMutableString stringWithString:primary ?: @""];
+    NSString *launchdPath = @"/var/mobile/dopamine-launchd.log";
+    NSString *launchdLog = [NSString stringWithContentsOfFile:launchdPath encoding:NSUTF8StringEncoding error:nil];
+    if (launchdLog.length) {
+        [combined appendFormat:@"\n\n===== 独立 launchd 日志：%@ =====\n%@", launchdPath, launchdLog];
+    }
+
+    NSString *crashDirectory = @"/var/mobile/Library/Logs/CrashReporter";
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSString *latestCrashPath = nil;
+    NSDate *latestCrashDate = nil;
+    for (NSString *name in [fileManager contentsOfDirectoryAtPath:crashDirectory error:nil]) {
+        if (!([name hasPrefix:@"launchd-"] || [name hasPrefix:@"userspace-panic-"] || [name hasPrefix:@"panic-full-"] || [name hasPrefix:@"watchdog-"]) || ![name hasSuffix:@".ips"]) continue;
+        NSString *path = [crashDirectory stringByAppendingPathComponent:name];
+        NSDate *modified = [fileManager attributesOfItemAtPath:path error:nil][NSFileModificationDate];
+        if (modified && [modified timeIntervalSinceNow] > -86400 && (!latestCrashDate || [modified compare:latestCrashDate] == NSOrderedDescending)) {
+            latestCrashDate = modified;
+            latestCrashPath = path;
+        }
+    }
+    if (latestCrashPath) {
+        NSString *crashLog = [NSString stringWithContentsOfFile:latestCrashPath encoding:NSUTF8StringEncoding error:nil];
+        if (crashLog.length) [combined appendFormat:@"\n\n===== 故障报告：%@，修改时间 %@ =====\n%@", latestCrashPath, latestCrashDate, crashLog];
+    }
+
+    return combined;
 }
 
 - (BOOL)isUpdateAvailable
@@ -207,20 +305,25 @@
 
 - (void)sendLog:(NSString*)log debug:(BOOL)debug update:(BOOL)update
 {
-    if (!self.logView || !log)
+    if (!log)
         return;
 
     [_logLock lock];
 
     [self.logRecord addObject:log];
+    [self persistJailbreakLogLine:log];
+
+    if (!self.logView) {
+        [_logLock unlock];
+        return;
+    }
 
     BOOL isDebug = self.logView.class == DODebugLogView.class;
     if (debug && !isDebug) {
         [_logLock unlock];
         return;
     }
-        
-    
+
     if (update) {
         if ([self.logView respondsToSelector:@selector(updateLog:)]) {
             [self.logView updateLog:log];
@@ -239,10 +342,10 @@
 
 - (void)shareLogRecordFromView:(UIView *)sourceView
 {
-    if (self.logRecord.count == 0)
-        return;
-
     NSString *log = [self.logRecord componentsJoinedByString:@"\n"];
+    if (log.length == 0) log = [self lastJailbreakLog];
+    if (log.length == 0)
+        return;
     UIActivityViewController *activityViewController = [[UIActivityViewController alloc] initWithActivityItems:@[log] applicationActivities:nil];
     activityViewController.popoverPresentationController.sourceView = sourceView;
     activityViewController.popoverPresentationController.sourceRect = sourceView.bounds;
@@ -255,6 +358,16 @@
         return;
 
     [self.logView didComplete];
+}
+
+- (void)failLastLog
+{
+    if (!self.logView)
+        return;
+
+    if ([self.logView respondsToSelector:@selector(didFail)]) {
+        [self.logView didFail];
+    }
 }
 
 - (void)observeFileDescriptor:(int)fd withCallback:(void (^)(char *line))callbackBlock
@@ -298,6 +411,33 @@
 
 - (void)startLogCapture
 {
+    [_logLock lock];
+    [self.logRecord removeAllObjects];
+
+    NSString *previousPath = [_documentsDirectory stringByAppendingPathComponent:@"jailbreak.previous.log"];
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    if ([fileManager fileExistsAtPath:self.jailbreakLogPath]) {
+        [fileManager removeItemAtPath:previousPath error:nil];
+        [fileManager copyItemAtPath:self.jailbreakLogPath toPath:previousPath error:nil];
+    }
+
+    const char *path = self.jailbreakLogPath.fileSystemRepresentation;
+    if (_logFileFd >= 0) {
+        close(_logFileFd);
+        _logFileFd = -1;
+    }
+    // Keep this inode open for the rest of the run. Re-opening after uid 0 can fail.
+    _logFileFd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    if (_logFileFd >= 0) {
+        fchmod(_logFileFd, 0644);
+    } else {
+        NSLog(@"jailbreak.log open failed: errno=%d (%s) path=%s", errno, strerror(errno), path);
+    }
+
+    NSString *header = [NSString stringWithFormat:@"===== jailbreak %@ path=%@ uid=%d =====", [NSDate date], self.jailbreakLogPath, getuid()];
+    [_logLock unlock];
+    [self persistJailbreakLogLine:header];
+
     [self observeFileDescriptor:STDOUT_FILENO withCallback:^(char *line) {
         NSString *str = [NSString stringWithUTF8String:line];
         [self sendLog:str debug:YES];
