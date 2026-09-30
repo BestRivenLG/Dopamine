@@ -23,17 +23,17 @@ int xpc_receive_mach_msg_hook(void *msg, void *a2, void *a3, void *a4, xpc_objec
 	size_t msgBufSize = 0;
     struct jbserver_mach_msg *jbsMachMsg = (struct jbserver_mach_msg *)dispatch_mach_msg_get_msg(msg, &msgBufSize);
 	bool wasProcessed = false;
-	static unsigned checkinLogCount = 0;
-	bool logCheckin = jbsMachMsg && msgBufSize >= sizeof(struct jbserver_mach_msg) && jbsMachMsg->magic == JBSERVER_MACH_MAGIC &&
-		__sync_fetch_and_add(&checkinLogCount, 1) < 16;
-	if (logCheckin) jb_log("mach message candidate id=0x%x action=%llu size=%u buffer=%zu", jbsMachMsg->hdr.msgh_id, (unsigned long long)jbsMachMsg->action, jbsMachMsg->hdr.msgh_size, msgBufSize);
     if (jbsMachMsg != NULL && msgBufSize >= sizeof(mach_msg_header_t)) {
         size_t msgSize = jbsMachMsg->hdr.msgh_size;
         if (msgSize <= msgBufSize && msgSize >= sizeof(struct jbserver_mach_msg) && jbsMachMsg->magic == JBSERVER_MACH_MAGIC) {
 			mach_msg_context_trailer_t *trailer = (mach_msg_context_trailer_t *)((uint8_t *)jbsMachMsg + round_msg(jbsMachMsg->hdr.msgh_size));
-			if (logCheckin) jb_log("mach checkin handle begin action=%llu", (unsigned long long)jbsMachMsg->action);
-			int handled = jbserver_received_mach_message(&trailer->msgh_audit, jbsMachMsg);
-			if (logCheckin) jb_log("mach checkin handle end action=%llu result=%d", (unsigned long long)jbsMachMsg->action, handled);
+			uint64_t action = jbsMachMsg->action;
+			static unsigned machTraceCount[4] = { 0 };
+			bool traceMach = action < 4 && __atomic_fetch_add(&machTraceCount[action], 1, __ATOMIC_RELAXED) < 12;
+			pid_t senderPid = audit_token_to_pid(trailer->msgh_audit);
+			if (traceMach) jb_log("bootstrap Mach begin sender=%d action=%llu", senderPid, (unsigned long long)action);
+			int result = jbserver_received_mach_message(&trailer->msgh_audit, jbsMachMsg);
+			if (traceMach) jb_log("bootstrap Mach end sender=%d action=%llu result=%d", senderPid, (unsigned long long)action, result);
 			wasProcessed = true;
             // Pass the message to xpc_receive_mach_msg anyway, it will get rid of it for us
         }

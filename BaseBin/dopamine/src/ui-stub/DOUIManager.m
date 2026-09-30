@@ -27,6 +27,11 @@
 	[self sendLog:log debug:debug update:NO];
 }
 
+- (NSString *)jailbreakLogPath
+{
+	return @"/var/mobile/dopamine-standalone.log";
+}
+
 - (NSArray *)enabledPackageManagers
 {
 	return nil;

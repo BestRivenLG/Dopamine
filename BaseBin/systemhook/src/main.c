@@ -414,8 +414,16 @@ __attribute__((constructor)) static void initializer(void)
 		void **posix_spawn_with_filter = litehook_find_dsc_symbol("/usr/lib/system/libsystem_kernel.dylib", "_posix_spawn_with_filter");
 		void **execve_with_filter      = litehook_find_dsc_symbol("/usr/lib/system/libsystem_kernel.dylib", "_execve_with_filter");
 
-		*posix_spawn_with_filter = __posix_spawn_hook_with_filter;
-		*execve_with_filter      = __execve_hook;
+		if (posix_spawn_with_filter && execve_with_filter) {
+			*posix_spawn_with_filter = __posix_spawn_hook_with_filter;
+			*execve_with_filter      = __execve_hook;
+		}
+		else {
+			// A cache layout or access failure must not crash every injected
+			// service before main. Use the ordinary instruction hooks instead.
+			litehook_hook_function(__posix_spawn, __posix_spawn_hook);
+			litehook_hook_function(__execve, __execve_hook);
+		}
 	}
 
 	// Hook the dyld_shared_cache __fcntl to jump to the dyld __fcntl instead

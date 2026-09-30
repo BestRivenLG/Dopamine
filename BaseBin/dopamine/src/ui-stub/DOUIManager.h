@@ -18,6 +18,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)sendLog:(NSString*)log debug:(BOOL)debug update:(BOOL)update;
 - (void)sendLog:(NSString*)log debug:(BOOL)debug;
+- (NSString *)jailbreakLogPath;
 
 - (NSArray *)enabledPackageManagers;
 - (id)renderBootLogo;

@@ -6,18 +6,48 @@
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
+#include <dispatch/dispatch.h>
+#include <stdbool.h>
+#include <errno.h>
 
 #define LOG_PATH_FILE "/var/mobile/dopamine-log-path"
 #define FALLBACK_LOG "/var/mobile/dopamine-launchd.log"
 
-static void jb_log_write_path(const char *path, const char *line)
+static bool jb_log_write_path(const char *path, const char *line)
 {
-	if (!path || !path[0] || !line) return;
+	if (!path || !path[0] || !line) return false;
 	int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0644);
-	if (fd < 0) return;
-	write(fd, line, strlen(line));
-	fsync(fd);
+	if (fd < 0) return false;
+	size_t length = strlen(line);
+	size_t offset = 0;
+	while (offset < length) {
+		ssize_t written = write(fd, line + offset, length - offset);
+		if (written < 0 && errno == EINTR) continue;
+		if (written <= 0) break;
+		offset += (size_t)written;
+	}
 	close(fd);
+	return offset == length;
+}
+
+static const char *jb_log_path(void)
+{
+	static char path[512];
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		int fd = open(LOG_PATH_FILE, O_RDONLY);
+		if (fd >= 0) {
+			ssize_t n = read(fd, path, sizeof(path) - 1);
+			close(fd);
+			if (n > 0) {
+				path[n] = 0;
+				char *nl = strchr(path, '\n');
+				if (nl) *nl = 0;
+			}
+		}
+		if (!path[0]) strlcpy(path, FALLBACK_LOG, sizeof(path));
+	});
+	return path;
 }
 
 void jb_log(const char *fmt, ...)
@@ -35,19 +65,8 @@ void jb_log(const char *fmt, ...)
 	char line[1200];
 	snprintf(line, sizeof(line), "[launchd %02d:%02d:%02d] %s\n", tm.tm_hour, tm.tm_min, tm.tm_sec, body);
 
-	jb_log_write_path(FALLBACK_LOG, line);
-
-	char extra[512];
-	extra[0] = 0;
-	int pfd = open(LOG_PATH_FILE, O_RDONLY);
-	if (pfd >= 0) {
-		ssize_t n = read(pfd, extra, sizeof(extra) - 1);
-		close(pfd);
-		if (n > 0) {
-			extra[n] = 0;
-			char *nl = strchr(extra, '\n');
-			if (nl) *nl = 0;
-			jb_log_write_path(extra, line);
-		}
+	const char *path = jb_log_path();
+	if (!jb_log_write_path(path, line) && strcmp(path, FALLBACK_LOG) != 0) {
+		jb_log_write_path(FALLBACK_LOG, line);
 	}
 }

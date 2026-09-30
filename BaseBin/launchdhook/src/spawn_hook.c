@@ -243,13 +243,47 @@ int __posix_spawn_hook(pid_t *restrict pid, const char *restrict path,
 		}
 	}
 
-	bool isXpcproxy = path && !strcmp(path, "/usr/libexec/xpcproxy");
-	static unsigned xpcproxyLogCount = 0;
-	unsigned xpcproxyIndex = isXpcproxy ? __sync_fetch_and_add(&xpcproxyLogCount, 1) : 0;
-	bool logXpcproxy = isXpcproxy && xpcproxyIndex < 64;
-	if (logXpcproxy && xpcproxyIndex < 16) jb_log("xpcproxy spawn begin service=%s", argv && argv[1] ? argv[1] : "(null)");
+	// Safe-mode diagnostic: these services must be able to start while clients
+	// wait synchronously for notification registration or logging preferences.
+	// Skip systemhook insertion only; the patched dyld remains in use.
+	if (path && !strcmp(path, "/usr/libexec/xpcproxy") && argv && argv[0] && argv[1] &&
+		(!strcmp(argv[1], "com.apple.notifyd") || !strcmp(argv[1], "com.apple.logd")) &&
+		access(JBROOT_PATH("/basebin/.safe_mode"), F_OK) == 0) {
+		char **cleanEnv = envbuf_mutcopy((const char **)envp);
+		if (envp && !cleanEnv) return ENOMEM;
+		if (cleanEnv) envbuf_unsetenv(&cleanEnv, "DYLD_INSERT_LIBRARIES");
+		int r = __posix_spawn_orig_wrapper(pid, path, desc, argv, cleanEnv ?: envp);
+		envbuf_free(cleanEnv);
+		static bool didLogService[2] = { false, false };
+		size_t serviceIndex = !strcmp(argv[1], "com.apple.logd") ? 1 : 0;
+		if (!__atomic_exchange_n(&didLogService[serviceIndex], true, __ATOMIC_ACQ_REL) || r != 0) {
+			jb_log("service-noinsert diagnostic service=%s ret=%d pid=%d", argv[1], r, pid ? *pid : -1);
+		}
+		return r;
+	}
+	// Bound diagnostics to boot dependencies seen in the panic wait chains.
+	// Each service is logged only on its first attempt in this launchd instance.
+	const char *tracedServices[] = {
+		"com.apple.cfprefsd.xpc.daemon", "com.apple.cfprefsd.xpc.agent",
+		"com.apple.configd", "com.apple.runningboardd", "com.apple.watchdogd",
+		"com.apple.MobileFileIntegrity", "com.apple.backboardd",
+	};
+	static bool didTraceService[sizeof(tracedServices) / sizeof(tracedServices[0])];
+	bool traceSpawn = false;
+	if (path && !strcmp(path, "/usr/libexec/xpcproxy") && argv && argv[0] && argv[1]) {
+		for (size_t i = 0; i < sizeof(tracedServices) / sizeof(tracedServices[0]); i++) {
+			if (!strcmp(argv[1], tracedServices[i])) {
+				traceSpawn = !__atomic_exchange_n(&didTraceService[i], true, __ATOMIC_ACQ_REL);
+				break;
+			}
+		}
+	}
+	if (traceSpawn) {
+		jb_log("bootstrap spawn begin service=%s insert=%s", argv[1],
+			envbuf_getenv((const char **)envp, "DYLD_INSERT_LIBRARIES") ?: "(null)");
+	}
 	int r = posix_spawn_hook_shared(pid, path, desc, argv, envp, __posix_spawn_orig_wrapper, systemwide_trust_file_by_path, platform_set_process_debugged, jbsetting(jetsamMultiplier));
-	if (logXpcproxy) jb_log("xpcproxy spawn end service=%s ret=%d pid=%d", argv && argv[1] ? argv[1] : "(null)", r, pid ? *pid : -1);
+	if (traceSpawn) jb_log("bootstrap spawn end service=%s ret=%d pid=%d", argv[1], r, r == 0 && pid ? *pid : -1);
 	return r;
 }
 

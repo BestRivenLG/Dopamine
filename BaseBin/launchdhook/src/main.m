@@ -108,7 +108,7 @@ __attribute__((constructor)) static void initializer(void)
 	}
 
 	bool firstLoad = false;
-	jb_log("launchdhook init pid=%d insert=%s initialized=%s", getpid(), getenv("DYLD_INSERT_LIBRARIES") ?: "(null)", getenv("DOPAMINE_INITIALIZED") ?: "(null)");
+	jb_log("launchdhook diagnostic=ios15-data-pac-fix-20260930 init pid=%d insert=%s initialized=%s", getpid(), getenv("DYLD_INSERT_LIBRARIES") ?: "(null)", getenv("DOPAMINE_INITIALIZED") ?: "(null)");
 	if (getenv("DOPAMINE_INITIALIZED") != 0) {
 		// If Dopamine was initialized before, we assume we're coming from a userspace reboot
 
